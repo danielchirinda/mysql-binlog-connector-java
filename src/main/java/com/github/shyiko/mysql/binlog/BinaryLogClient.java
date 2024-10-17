@@ -1020,7 +1020,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
     private void fetchBinlogFilenameAndPosition() throws IOException {
         ResultSetRowPacket[] resultSet;
-        channel.write(new QueryCommand("show master status"));
+        channel.write(new QueryCommand("SHOW BINARY LOG STATUS"));
         resultSet = readResultSet();
         if (resultSet.length == 0) {
             throw new IOException("Failed to determine binlog filename/position");
