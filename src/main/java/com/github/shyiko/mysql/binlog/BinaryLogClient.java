@@ -1025,6 +1025,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
     private void fetchBinlogFilenameAndPosition() throws IOException {
         ResultSetRowPacket[] resultSet;
+      
         if (!databaseVersion.isMariaDb() && databaseVersion.isGreaterThanOrEqualTo(8, 4)) {
             channel.write(new QueryCommand("show binary log status"));
         } else {
