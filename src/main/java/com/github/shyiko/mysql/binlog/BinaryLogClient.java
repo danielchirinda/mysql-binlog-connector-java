@@ -137,6 +137,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private volatile long binlogPosition = 4;
     private volatile long connectionId;
     private SSLMode sslMode = SSLMode.DISABLED;
+    private boolean useNonGracefulDisconnect = false;
 
     protected GtidSet gtidSet;
     protected final Object gtidSetAccessLock = new Object();
@@ -174,8 +175,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private final Lock keepAliveThreadExecutorLock = new ReentrantLock();
     private boolean useSendAnnotateRowsEvent;
 
-
-    private Boolean isMariaDB;
+    private BinaryLogDatabaseVersion databaseVersion;
     private int mariaDbSlaveCapability = 4;
 
     /**
@@ -247,6 +247,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
             throw new IllegalArgumentException("SSL mode cannot be NULL");
         }
         this.sslMode = sslMode;
+    }
+
+    public void setUseNonGracefulDisconnect(boolean useNonGracefulDisconnect) {
+        this.useNonGracefulDisconnect = useNonGracefulDisconnect;
     }
 
     public long getMasterServerId() {
@@ -527,7 +531,10 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
      * @return true/false depending on whether we've connected to MariaDB.  NULL if not connected.
      */
     public Boolean getMariaDB() {
-        return isMariaDB;
+        if (databaseVersion != null) {
+            return databaseVersion.isMariaDb();
+        }
+        return null;
     }
 
     public boolean isUseSendAnnotateRowsEvent() {
@@ -585,7 +592,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                 }
                 GreetingPacket greetingPacket = receiveGreeting();
 
-                detectMariaDB(greetingPacket);
+                resolveDatabaseVersion(greetingPacket);
                 tryUpgradeToSSL(greetingPacket);
 
                 new Authenticator(greetingPacket, channel, schema, username, password).authenticate();
@@ -656,13 +663,11 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         }
     }
 
-    private void detectMariaDB(GreetingPacket packet) {
-        String serverVersion = packet.getServerVersion();
-        if ( serverVersion == null )
-            return;
-
-        this.isMariaDB = serverVersion.toLowerCase().contains("mariadb");
+    private void resolveDatabaseVersion(GreetingPacket packet) {
+        this.databaseVersion = BinaryLogDatabaseVersion.parse(packet.getServerVersion());
+        logger.info("Database version: " + this.databaseVersion);
     }
+
     /**
      * Apply additional options for connection before requesting binlog stream.
      */
@@ -782,7 +787,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
     protected void requestBinaryLogStream() throws IOException {
         long serverId = blocking ? this.serverId : 0; // http://bugs.mysql.com/bug.php?id=71178
-        if ( this.isMariaDB )
+        if ( this.databaseVersion.isMariaDb() )
             requestBinaryLogStreamMaria(serverId);
         else
             requestBinaryLogStreamMysql(serverId);
@@ -891,7 +896,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                         if (connectionLost) {
                             logger.info("Keepalive: Trying to restore lost connection to " + hostname + ":" + port);
                             try {
-                                terminateConnect();
+                                terminateConnect(useNonGracefulDisconnect);
                                 connect(connectTimeout);
                             } catch (Exception ce) {
                                 logger.warning("keepalive: Failed to restore connection to " + hostname + ":" + port +
@@ -999,7 +1004,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
             return;
 
         synchronized (gtidSetAccessLock) {
-            if ( this.isMariaDB ) {
+            if ( this.databaseVersion.isMariaDb() ) {
                 if ( gtidSet == null ) {
                     gtidSet = new MariadbGtidSet("");
                 } else if ( !(gtidSet instanceof MariadbGtidSet) ) {
@@ -1020,7 +1025,12 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
     private void fetchBinlogFilenameAndPosition() throws IOException {
         ResultSetRowPacket[] resultSet;
-        channel.write(new QueryCommand("SHOW BINARY LOG STATUS"));
+      
+        if (!databaseVersion.isMariaDb() && databaseVersion.isGreaterThanOrEqualTo(8, 4)) {
+            channel.write(new QueryCommand("show binary log status"));
+        } else {
+            channel.write(new QueryCommand("show master status"));
+        }
         resultSet = readResultSet();
         if (resultSet.length == 0) {
             throw new IOException("Failed to determine binlog filename/position");
@@ -1341,8 +1351,11 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     private void terminateConnect() throws IOException {
+        terminateConnect(false);
+    }
+    private void terminateConnect(boolean force) throws IOException {
         do {
-            disconnectChannel();
+            disconnectChannel(force);
         } while (!tryLockInterruptibly(connectLock, 1000, TimeUnit.MILLISECONDS));
         connectLock.unlock();
     }
@@ -1356,8 +1369,14 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     private void disconnectChannel() throws IOException {
+        disconnectChannel(false);
+    }
+    private void disconnectChannel(boolean force) throws IOException {
         connected = false;
         if (channel != null && channel.isOpen()) {
+            if (force) {
+                channel.setShouldUseSoLinger0();
+            }
             channel.close();
         }
     }
